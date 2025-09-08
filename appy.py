@@ -1,152 +1,133 @@
-# appy.py
-from pathlib import Path
 from datetime import date
-import sqlite3
 import streamlit as st
+import psycopg2
+import psycopg2.extras
 
-# ====== Config ======
-DB_PATH = Path.cwd() / "10ynueve_loyalty.db"
+# ====== Configuración de conexión a Supabase ======
+DB_CONFIG = {
+    "host": "db.fncsqlfigpidyuxiyskq.supabase.co",  # cambia según tu proyecto
+    "dbname": "postgres",
+    "user": "postgres",
+    "password": "Eda090592",  # 🔑 cambia esto por tu password real
+    "port": "5432"
+}
 
-# ====== Utilerías de BD ======
-def abrir_conexion() -> sqlite3.Connection:
-    if not DB_PATH.exists():
-        raise FileNotFoundError(f"No encontré la base en: {DB_PATH}")
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+def abrir_conexion():
+    conn = psycopg2.connect(**DB_CONFIG)
     return conn
 
-def obtener_cliente(conn: sqlite3.Connection, telefono: str):
-    cur = conn.cursor()
-    cur.execute("SELECT Name, Phone FROM Customers WHERE Phone=?", (telefono.strip(),))
-    row = cur.fetchone()
-    if row:
-        return row["Name"], row["Phone"]
+# ====== Utilerías de BD ======
+def obtener_cliente(conn, telefono: str):
+    with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute("SELECT name, phone FROM customers WHERE phone = %s", (telefono.strip(),))
+        row = cur.fetchone()
+        if row:
+            return row["name"], row["phone"]
     return None, telefono
 
-def obtener_tarjeta_abierta(conn: sqlite3.Connection, telefono: str):
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT ID_TARJETA, NUMERO_TARJETA,
-               COALESCE(FECHA_ULTIMO_SELLO, NULL) AS FECHA_ULTIMO_SELLO,
-               COALESCE(SELLOS, 0)               AS SELLOS
-        FROM TARJETAS
-        WHERE TELEFONO=? AND ESTADO='abierta'
-        ORDER BY NUMERO_TARJETA DESC
-        LIMIT 1
-        """,
-        (telefono.strip(),),
-    )
-    return cur.fetchone()
+def obtener_tarjeta_abierta(conn, telefono: str):
+    with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute(
+            """
+            SELECT id_tarjeta, numero_tarjeta,
+                   fecha_ultimo_sello,
+                   COALESCE(sellos, 0) AS sellos
+            FROM tarjetas
+            WHERE telefono = %s AND estado = 'abierta'
+            ORDER BY numero_tarjeta DESC
+            LIMIT 1
+            """,
+            (telefono.strip(),),
+        )
+        return cur.fetchone()
 
-def siguiente_id_tarjeta(conn: sqlite3.Connection) -> str:
-    cur = conn.cursor()
-    cur.execute("SELECT MAX(CAST(substr(ID_TARJETA,3) AS INTEGER)) AS maxnum FROM TARJETAS")
-    row = cur.fetchone()
-    maxnum = row["maxnum"] if row and row["maxnum"] is not None else 0
+def siguiente_id_tarjeta(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT MAX(CAST(SUBSTRING(id_tarjeta, 3) AS INTEGER)) FROM tarjetas")
+        maxnum = cur.fetchone()[0] or 0
     return f"T-{maxnum+1:03d}"
 
-def asegurar_tarjeta_abierta(conn: sqlite3.Connection, telefono: str):
-    """
-    Devuelve la tarjeta abierta si ya existe.
-    Si no existe, crea una nueva *marcando FECHA_ULTIMO_SELLO = hoy* para
-    que NO pueda usarse (sumar sello) el mismo día del alta.
-    """
+def asegurar_tarjeta_abierta(conn, telefono: str):
     row = obtener_tarjeta_abierta(conn, telefono)
     if row:
         return row
 
     id_nueva = siguiente_id_tarjeta(conn)
-    cur = conn.cursor()
+    with conn.cursor() as cur:
+        cur.execute("SELECT COALESCE(MAX(numero_tarjeta),0) FROM tarjetas WHERE telefono = %s", (telefono.strip(),))
+        maxnum = cur.fetchone()[0] or 0
+        siguiente_num = maxnum + 1
 
-    # Siguiente número de tarjeta para ese teléfono
-    cur.execute("SELECT COALESCE(MAX(NUMERO_TARJETA),0) AS maxnum FROM TARJETAS WHERE TELEFONO=?", (telefono.strip(),))
-    maxnum = cur.fetchone()["maxnum"] or 0
-    siguiente_num = maxnum + 1
-
-    # IMPORTANTE: FECHA_ULTIMO_SELLO = DATE('now') y SELLOS = 0
-    cur.execute(
-        """
-        INSERT INTO TARJETAS (
-            ID_TARJETA, TELEFONO, FECHA_INICIO, FECHA_FIN,
-            ESTADO, NUMERO_TARJETA, FECHA_ULTIMO_SELLO, SELLOS
+        # FECHA_ULTIMO_SELLO = hoy, para que no se pueda usar en el mismo día
+        cur.execute(
+            """
+            INSERT INTO tarjetas (
+                id_tarjeta, telefono, fecha_inicio, fecha_fin,
+                estado, numero_tarjeta, fecha_ultimo_sello, sellos
+            )
+            VALUES (%s, %s, CURRENT_DATE, NULL,
+                    'abierta', %s, CURRENT_DATE, 0)
+            """,
+            (id_nueva, telefono.strip(), siguiente_num),
         )
-        VALUES (
-            ?, ?, DATE('now'), NULL,
-            'abierta', ?, DATE('now'), 0
-        )
-        """,
-        (id_nueva, telefono.strip(), siguiente_num),
-    )
     conn.commit()
-
-    # Regresamos la fila recién creada con las columnas útiles
     return obtener_tarjeta_abierta(conn, telefono)
 
-
-def avanzar_sello(conn: sqlite3.Connection, id_tarjeta: str):
-    """
-    Suma un sello si no se ha puesto ya hoy.
-    Robusto ante valores NULL en SELLOS/FECHA_ULTIMO_SELLO.
-    """
+def avanzar_sello(conn, id_tarjeta: str):
     hoy = date.today().isoformat()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT COALESCE(FECHA_ULTIMO_SELLO, NULL) AS FECHA_ULTIMO_SELLO, COALESCE(SELLOS, 0) AS SELLOS FROM TARJETAS WHERE ID_TARJETA=?",
-        (id_tarjeta,),
-    )
-    row = cur.fetchone()
-    if not row:
-        return 0, False
+    with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute(
+            "SELECT fecha_ultimo_sello, COALESCE(sellos, 0) AS sellos FROM tarjetas WHERE id_tarjeta = %s",
+            (id_tarjeta,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return 0, False
 
-    fecha_ultimo = row["FECHA_ULTIMO_SELLO"]
-    sellos_actuales = row["SELLOS"] if row["SELLOS"] is not None else 0
+        if row["fecha_ultimo_sello"] == hoy:
+            return row["sellos"], False  # ya se registró hoy
 
-    if fecha_ultimo == hoy:
-        return sellos_actuales, False  # ya registró hoy
-
-    nuevo = sellos_actuales + 1
-    cur.execute(
-        "UPDATE TARJETAS SET SELLOS=?, FECHA_ULTIMO_SELLO=? WHERE ID_TARJETA=?",
-        (nuevo, hoy, id_tarjeta),
-    )
+        nuevo = row["sellos"] + 1
+        cur.execute(
+            "UPDATE tarjetas SET sellos = %s, fecha_ultimo_sello = %s WHERE id_tarjeta = %s",
+            (nuevo, hoy, id_tarjeta),
+        )
     conn.commit()
     return nuevo, True
 
-def consultar_descuento_por_sellos(conn: sqlite3.Connection, sellos: int):
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) AS c FROM DESCUENTOS WHERE ACTIVO=1")
-    total = cur.fetchone()["c"]
-    if total == 0:
-        return None
-    offset = max(0, min(sellos - 1, total - 1))
-    cur.execute(
-        """
-        SELECT DESCRIPCION, TIPO, VALOR
-        FROM DESCUENTOS
-        WHERE ACTIVO=1
-        ORDER BY ID_DESCUENTO
-        LIMIT 1 OFFSET ?
-        """,
-        (offset,),
-    )
-    row = cur.fetchone()
-    if not row:
-        return None
-    return {
-        "descripcion": row["DESCRIPCION"],
-        "tipo": row["TIPO"],
-        "valor": float(row["VALOR"]),
-        "posicion": offset + 1,
-        "total_activos": total,
-    }
+def consultar_descuento_por_sellos(conn, sellos: int):
+    with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cur.execute("SELECT COUNT(*) FROM descuentos WHERE activo=1")
+        total = cur.fetchone()[0]
+        if total == 0:
+            return None
+        offset = max(0, min(sellos - 1, total - 1))
+        cur.execute(
+            """
+            SELECT descripcion, tipo, valor
+            FROM descuentos
+            WHERE activo=1
+            ORDER BY id_descuento
+            LIMIT 1 OFFSET %s
+            """,
+            (offset,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "descripcion": row["descripcion"],
+            "tipo": row["tipo"],
+            "valor": float(row["valor"]),
+            "posicion": offset + 1,
+            "total_activos": total,
+        }
 
 # ====== UI ======
 st.set_page_config(page_title="Sistema de Sellos 10ynueve", page_icon="🐾", layout="centered")
 st.markdown("<h1>🐾 Bienvenido al sistema de sellos 10ynueve</h1>", unsafe_allow_html=True)
 
 modo = st.radio("Selecciona una opción:", ["Cliente Perrón", "Nuevo Cliente"])
-
 st.divider()
 
 if modo == "Cliente Perrón":
@@ -166,8 +147,8 @@ if modo == "Cliente Perrón":
 
                 tarjeta = asegurar_tarjeta_abierta(conn, telefono)
                 if tarjeta:
-                    id_tarjeta = tarjeta["ID_TARJETA"]
-                    num_tarjeta = tarjeta["NUMERO_TARJETA"]
+                    id_tarjeta = tarjeta["id_tarjeta"]
+                    num_tarjeta = tarjeta["numero_tarjeta"]
 
                     # avanzar sello
                     sellos, avanzo = avanzar_sello(conn, id_tarjeta)
@@ -200,13 +181,13 @@ else:
             conn = None
             try:
                 conn = abrir_conexion()
-                cur = conn.cursor()
-                cur.execute("SELECT 1 FROM Customers WHERE Phone=?", (telefono.strip(),))
-                if not cur.fetchone():
-                    cur.execute("INSERT INTO Customers (Name, Phone) VALUES (?,?)", (nombre.strip(), telefono.strip()))
-                    conn.commit()
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1 FROM customers WHERE phone = %s", (telefono.strip(),))
+                    if not cur.fetchone():
+                        cur.execute("INSERT INTO customers (name, phone) VALUES (%s, %s)", (nombre.strip(), telefono.strip()))
+                        conn.commit()
                 tarjeta = asegurar_tarjeta_abierta(conn, telefono)
-                st.success(f"Cliente {nombre} registrado con tarjeta {tarjeta['ID_TARJETA']}")
+                st.success(f"Cliente {nombre} registrado con tarjeta {tarjeta['id_tarjeta']}")
             except Exception as e:
                 st.error(f"Error: {e}")
             finally:
@@ -214,31 +195,5 @@ else:
                     conn.close()
 
 st.caption("Listo para empezar a acumular sellos 🧼🥤")
-# ====== EXPORTAR DATOS / RESPALDO ======
-import pandas as pd
 
-if st.button("📥 Descargar respaldo de la base de datos"):
-    try:
-        conn = abrir_conexion()
-        # Exportamos Customers y TARJETAS
-        clientes = pd.read_sql_query("SELECT * FROM Customers", conn)
-        tarjetas = pd.read_sql_query("SELECT * FROM TARJETAS", conn)
-
-        # Guardamos en Excel
-        with pd.ExcelWriter("respaldo_loyalty.xlsx") as writer:
-            clientes.to_excel(writer, sheet_name="Clientes", index=False)
-            tarjetas.to_excel(writer, sheet_name="Tarjetas", index=False)
-
-        with open("respaldo_loyalty.xlsx", "rb") as f:
-            st.download_button(
-                label="⬇️ Descargar respaldo Excel",
-                data=f,
-                file_name="respaldo_loyalty.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-    except Exception as e:
-        st.error(f"Error al generar respaldo: {e}")
-    finally:
-        if 'conn' in locals():
-            conn.close()
 

@@ -214,3 +214,31 @@ else:
                     conn.close()
 
 st.caption("Listo para empezar a acumular sellos 🧼🥤")
+# ====== EXPORTAR DATOS / RESPALDO ======
+import pandas as pd
+
+if st.button("📥 Descargar respaldo de la base de datos"):
+    try:
+        conn = abrir_conexion()
+        # Exportamos Customers y TARJETAS
+        clientes = pd.read_sql_query("SELECT * FROM Customers", conn)
+        tarjetas = pd.read_sql_query("SELECT * FROM TARJETAS", conn)
+
+        # Guardamos en Excel
+        with pd.ExcelWriter("respaldo_loyalty.xlsx") as writer:
+            clientes.to_excel(writer, sheet_name="Clientes", index=False)
+            tarjetas.to_excel(writer, sheet_name="Tarjetas", index=False)
+
+        with open("respaldo_loyalty.xlsx", "rb") as f:
+            st.download_button(
+                label="⬇️ Descargar respaldo Excel",
+                data=f,
+                file_name="respaldo_loyalty.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+    except Exception as e:
+        st.error(f"Error al generar respaldo: {e}")
+    finally:
+        if 'conn' in locals():
+            conn.close()
+

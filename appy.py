@@ -46,7 +46,7 @@ def get_customer_by_phone(phone: str):
 
     # 1) Vista minúsculas
     try:
-        res = supabase.table("customers_api").select("*").eq("phone", phone).maybe_single().execute()
+       res = supabase.table("customers_api").select("*").eq("phone", phone).maybe_single().execute()
         if isinstance(res.data, dict) and res.data:
             return {"Name": res.data.get("name") or res.data.get("Name"),
                     "Phone": res.data.get("phone") or res.data.get("Phone")}
@@ -147,3 +147,4 @@ else:
                     st.exception(e)
 
 st.caption("Listo para empezar a acumular sellos ✨")
+

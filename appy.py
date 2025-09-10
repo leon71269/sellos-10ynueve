@@ -15,15 +15,16 @@ from supabase import create_client, Client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 # === Helpers de BD ===
 def get_customer_by_phone(phone: str):
-    try:
-        # === Elige A o B y deja SOLO una de las dos consultas ===
-        # Opción A (tabla):
-        # res = supabase.table("Customers").select("Name,Phone").eq("Phone", phone).maybe_single().execute()
+    p = phone.strip()
 
-        # Opción B (vista):
-        res = supabase.table("customers_api").select("*").eq("phone", phone).maybe_single().execute()
-
+    # 1) Intento directo a la tabla con nombres tal cual (case-sensitive)
+    res = supabase.table("Customers").select("*").eq("Phone", p).maybe_single().execute()
+    if res.data:
         return res.data
+
+    # 2) Fallback a la vista en minúsculas
+    res = supabase.table("customers_api").select("*").eq("phone", p).maybe_single().execute()
+    return res.data
     except Exception as e:
         import traceback
         st.error("Fallo al consultar cliente")
@@ -155,6 +156,7 @@ elif opcion == "Nuevo Cliente":
             s = stamps_count(phone.strip())
             pct = current_discount_pct(s)
             st.caption(f"Sellos: {s} — Descuento actual: {pct:.1f}%")
+
 
 
 

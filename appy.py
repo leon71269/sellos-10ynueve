@@ -1,193 +1,221 @@
-# appy.py — 10ynueve · Sistema de Sellos
-import streamlit as st
+import re
 from datetime import date, datetime
-from typing import Optional, Dict, Any, Tuple, List
-
-# ========= Conexión a Supabase (usa st.secrets) =========
+import streamlit as st
 from supabase import create_client, Client
 
+# ============================
+#  Conexión (usa st.secrets)
+# ============================
 def _clean_ascii(s: str) -> str:
     s = (s or "").strip()
     return "".join(ch for ch in s if 32 <= ord(ch) < 127)
 
-SUPABASE_URL  = _clean_ascii(st.secrets["SUPABASE_URL"])
-SUPABASE_KEY  = _clean_ascii(st.secrets["SUPABASE_ANON_KEY"])
-sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+SUPABASE_URL = _clean_ascii(st.secrets["SUPABASE_URL"])
+SUPABASE_ANON_KEY = _clean_ascii(st.secrets["SUPABASE_ANON_KEY"])
 
-# ========= Helpers de BD =========
-def get_customer_by_phone(phone: str) -> Optional[Dict[str, Any]]:
-    """Lee desde la vista customers_api (name, phone)."""
-    phone = (phone or "").strip()
-    res = sb.table("customers_api").select("*").eq("phone", phone).maybe_single().execute()
-    data = getattr(res, "data", None)
-    if isinstance(data, dict):
-        return data
-    return None
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
-def next_sequential_id(prefix: str, table: str, id_col: str) -> str:
-    """Genera ID tipo T-001 / C-001 según cantidad actual."""
-    res = sb.table(table).select(id_col, count="exact").execute()
-    count = getattr(res, "count", 0) or 0
-    return f"{prefix}-{count+1:03d}"
+# ============================
+#  Helpers de BD
+# ============================
 
-def get_open_card(phone: str) -> Optional[Dict[str, Any]]:
-    """Regresa tarjeta abierta de un teléfono (si existe)."""
-    q = (
-        sb.table("TARJETAS")
+def normalize_phone(raw: str) -> str:
+    """Deja solo dígitos."""
+    return "".join(re.findall(r"\d+", (raw or "")))
+
+def get_customer_by_phone(phone: str):
+    """
+    Lee via VISTA 'customers_api' (name/phone en minúsculas).
+    """
+    res = (
+        supabase.table("customers_api")
         .select("*")
+        .eq("phone", phone)
+        .maybe_single()
+        .execute()
+    )
+    return res.data  # dict | None
+
+def create_customer(name: str, phone: str):
+    supabase.table("Customers").insert(
+        {"Name": (name or "").strip(), "Phone": (phone or "").strip()}
+    ).execute()
+
+def next_card_number() -> int:
+    # cuenta filas exactas en TARJETAS y suma 1
+    count = supabase.table("TARJETAS").select("NUMERO_TARJETA", count="exact").execute().count or 0
+    return count + 1
+
+def ensure_open_card(phone: str):
+    """
+    Regresa la tarjeta abierta del teléfono; si no existe, crea una.
+    Campos esperados en TARJETAS:
+      - ID_TARJETA (text)  ej. T-001
+      - TELEFONO (text)
+      - FECHA_INICIO (date)
+      - FECHA_FIN (date, null)
+      - ESTADO (text: 'abierta'/'cerrada')
+      - NUMERO_TARJETA (int)
+      - FECHA_ULTIMO_SELLO (date, null)
+      - SELLOS (int, default 0)
+    """
+    q = (
+        supabase.table("TARJETAS")
+        .select("ID_TARJETA, TELEFONO, FECHA_INICIO, FECHA_FIN, ESTADO, NUMERO_TARJETA, FECHA_ULTIMO_SELLO, SELLOS")
         .eq("TELEFONO", phone)
         .eq("ESTADO", "abierta")
-        .order("FECHA_INICIO", desc=True)
-        .limit(1)
+        .maybe_single()
         .execute()
     )
-    rows = q.data or []
-    return rows[0] if rows else None
+    if q.data:
+        return q.data
 
-def ensure_open_card(phone: str) -> Dict[str, Any]:
-    """Devuelve una tarjeta abierta; si no existe crea una."""
-    card = get_open_card(phone)
-    if card:
-        return card
-
-    new_id = next_sequential_id("T", "TARJETAS", "ID_TARJETA")
-    today = str(date.today())
-    payload = {
-        "ID_TARJETA": new_id,
+    # crear nueva
+    num = next_card_number()
+    new_card = {
+        "ID_TARJETA": f"T-{num:03d}",
         "TELEFONO": phone,
-        "FECHA_INICIO": today,
-        "FECHA_FIN": None,
+        "FECHA_INICIO": date.today().isoformat(),
         "ESTADO": "abierta",
-        "NUMERO_TARJETA": 1,
-        "FECHA_ULTIMO_SELLO": None,
+        "NUMERO_TARJETA": num,
         "SELLOS": 0,
     }
-    ins = sb.table("TARJETAS").insert(payload).execute()
-    return ins.data[0]
+    supabase.table("TARJETAS").insert(new_card).execute()
+    return new_card
 
-def list_active_discounts() -> List[Dict[str, Any]]:
-    """Obtiene descuentos activos, ordenados por ID_DESCUENTO (D-001, D-002, ...)."""
-    res = (
-        sb.table("DESCUENTOS")
-        .select("*")
+def get_current_discount(sell_count: int) -> str:
+    """
+    Devuelve la etiqueta del renglón correspondiente a los sellos actuales.
+    Usa la tabla DESCUENTOS, ordenada por ID_DESCUENTO ascendente.
+    OFFSET = sellos (0-based), LIMIT 1.
+    """
+    q = (
+        supabase.table("DESCUENTOS")
+        .select("DESCRIPCION, TIPO, VALOR")
         .eq("ACTIVO", 1)
         .order("ID_DESCUENTO", desc=False)
+        .range(sell_count, sell_count)  # OFFSET=sellos, LIMIT=1
         .execute()
     )
-    return res.data or []
+    row = (q.data or [None])[0]
+    if not row:
+        return "Sin descuento"
 
-def current_reward_for_sellos(sellos: int, discounts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    tipo = (row.get("TIPO") or "").strip().upper()
+    valor = row.get("VALOR")
+    desc = row.get("DESCRIPCION") or "Descuento"
+
+    if tipo in {"PORCENTAJE", "PORCENTUAL", "PORCENTUALE"} and valor is not None:
+        return f"{desc} ({int(valor)}%)"
+    return desc
+
+def rpc_sellar_hoy(phone: str):
     """
-    Regresa el descuento correspondiente al índice 'sellos'.
-    Regla: offset = sellos actuales (0->primer descuento, 1->segundo, etc.)
-    Si se pasan los disponibles, se queda en el último.
+    Llama al RPC sellar_hoy(p_telefono text) que debe existir en la BD.
+    Retorna dict con {id_tarjeta, sellos, fecha}.
     """
-    if not discounts:
-        return {"DESCRIPCION": "Sin descuentos configurados", "TIPO": "", "VALOR": 0}
-    idx = min(max(sellos, 0), len(discounts) - 1)
-    return discounts[idx]
+    res = supabase.rpc("sellar_hoy", {"p_telefono": phone}).execute()
+    if isinstance(res.data, list) and res.data:
+        return res.data[0]
+    return None
 
-def already_stamped_today(card: Dict[str, Any]) -> bool:
-    """Candado diario."""
-    last = card.get("FECHA_ULTIMO_SELLO")
-    if not last:
-        return False
-    try:
-        last_d = datetime.strptime(last, "%Y-%m-%d").date()
-    except Exception:
-        # Por si llega como datetime ISO
-        try:
-            last_d = datetime.fromisoformat(last).date()
-        except Exception:
-            return False
-    return last_d == date.today()
+# ============================
+#  UI
+# ============================
 
-def add_stamp_today(card: Dict[str, Any]) -> Dict[str, Any]:
-    """Suma 1 sello (si no ha sellado hoy) y actualiza fecha_ultimo_sello."""
-    if already_stamped_today(card):
-        return card
-    new_count = int(card.get("SELLOS", 0) or 0) + 1
-    upd = (
-        sb.table("TARJETAS")
-        .update({"SELLOS": new_count, "FECHA_ULTIMO_SELLO": str(date.today())})
-        .eq("ID_TARJETA", card["ID_TARJETA"])
-        .execute()
-    )
-    return upd.data[0]
+st.set_page_config(page_title="10ynueve — Sistema de Sellos", page_icon="⭐", layout="centered")
 
-# ========= UI =========
-st.set_page_config(page_title="10ynueve — Sistema de Sellos", page_icon="✨", layout="wide")
-st.markdown("## 10ynueve — Sistema de Sellos")
+st.markdown(
+    "<h1 style='text-align:center;'>10ynueve — Sistema de Sellos</h1>",
+    unsafe_allow_html=True,
+)
 
 mode = st.radio("Selecciona una opción:", ["Cliente Perrón", "Nuevo Cliente"], horizontal=True)
 
-phone_input = st.text_input("Ingresa el número de teléfono del cliente:", value="", max_chars=20)
-col_buscar, col_sp = st.columns([1, 8])
-buscar = col_buscar.button("Buscar", type="primary")
+phone_input = st.text_input("Ingresa el número de teléfono del cliente:")
+phone_input = normalize_phone(phone_input)
 
-discounts = list_active_discounts()
-
-def paint_card_info(card: Dict[str, Any]):
-    sellos = int(card.get("SELLOS", 0) or 0)
-    reward = current_reward_for_sellos(sellos, discounts)
-    st.info(
-        f"*Tarjeta activa:* {card['ID_TARJETA']} · *Estado:* {card['ESTADO']} "
-        f"· *Número:* {card.get('NUMERO_TARJETA', 1)} · *Inicio:* {card['FECHA_INICIO']}"
-    )
-    st.success(f"*Sellos acumulados:* {sellos}")
-    st.warning(f"*Descuento actual:* {reward.get('DESCRIPCION', '—')} "
-               f"{'(%.0f%%)' % reward['VALOR'] if reward.get('TIPO')=='PORCENTAJE' else ''}")
-
-    # Candado diario
-    if already_stamped_today(card):
-        st.error("🔒 Esta tarjeta ya fue sellada hoy. Vuelve mañana.")
-    else:
-        if st.button("Sellar hoy ✅"):
-            updated = add_stamp_today(card)
-            st.success("¡Sello registrado!")
-            st.session_state["_just_updated_"] = True
-            st.rerun()
-
-if buscar:
-    phone = phone_input.strip()
-    if not phone:
-        st.error("Escribe un teléfono.")
-    else:
-        try:
-            cust = get_customer_by_phone(phone)
-            if mode == "Cliente Perrón":
+# ========== CLIENTE PERRÓN ==========
+if mode == "Cliente Perrón":
+    if st.button("Buscar", type="primary"):
+        if not phone_input:
+            st.error("Escribe un teléfono.")
+        else:
+            try:
+                cust = get_customer_by_phone(phone_input)
                 if not cust:
-                    st.error("Cliente no encontrado en *Customers*.")
+                    st.error("Cliente no encontrado en Customers.")
                     with st.expander("Sugerencia si usas la vista"):
-                        st.code(
-                            'CREATE OR REPLACE VIEW customers_api AS '
-                            'SELECT "Name" AS name, "Phone" AS phone FROM "Customers";',
-                            language="sql",
-                        )
+                        st.code('sql\nCREATE OR REPLACE VIEW customers_api AS SELECT "Name" AS name, "Phone" AS phone FROM "Customers";')
                 else:
-                    st.success(f"Cliente encontrado: *{cust['name']}* · {cust['phone']}")
-                    card = ensure_open_card(cust["phone"])
-                    paint_card_info(card)
+                    st.success(f"Cliente encontrado: {cust['name']} · {cust['phone']}")
+                    card = ensure_open_card(phone_input)
 
-            else:  # Nuevo Cliente
-                st.subheader("Dar de alta nuevo cliente")
-                name_new = st.text_input("Nombre")
-                if st.button("Registrar cliente y abrir tarjeta", type="primary"):
-                    if not name_new.strip():
-                        st.error("Nombre obligatorio.")
-                    else:
-                        # Si existe, usarlo; si no, crearlo
-                        if not cust:
-                            sb.table("Customers").insert(
-                                {"Name": name_new.strip(), "Phone": phone}
-                            ).execute()
-                            st.success("Cliente creado.")
-                        card = ensure_open_card(phone)
-                        paint_card_info(card)
+                    # Muestra tarjeta
+                    st.info(
+                        f"*Tarjeta activa:* {card['ID_TARJETA']} · "
+                        f"*Estado:* {card['ESTADO']} · "
+                        f"*Número:* {card['NUMERO_TARJETA']} · "
+                        f"*Inicio:* {card['FECHA_INICIO']}"
+                    )
 
-        except Exception as e:
-            st.error("Falló al consultar cliente.")
-            st.code(str(e))
-            st.stop()
+                    sellos = int(card.get("SELLOS") or 0)
+                    st.success(f"*Sellos acumulados:* {sellos}")
+
+                    etiqueta_desc = get_current_discount(sellos)
+                    st.warning(f"*Descuento actual:* {etiqueta_desc}")
+
+                    # --- Botón Sellar hoy (candado en BD via RPC) ---
+                    if st.button("Sellar hoy", type="primary"):
+                        try:
+                            # Para detectar si ya estaba sellado, guardamos los sellos previos
+                            prev_sellos = sellos
+                            upd = rpc_sellar_hoy(phone_input)
+
+                            # Releer tarjeta para refrescar valores
+                            card_ref = ensure_open_card(phone_input)
+                            new_sellos = int(card_ref.get("SELLOS") or 0)
+
+                            if new_sellos > prev_sellos:
+                                st.success(f"✅ Sello registrado. Sellos ahora: {new_sellos}.")
+                            else:
+                                st.warning("🔒 Ya se registró un sello hoy para este cliente.")
+
+                            # Nuevo descuento
+                            st.info(f"Descuento actual: {get_current_discount(new_sellos)}")
+
+                        except Exception as e:
+                            msg = str(e)
+                            if "ux_compras_telefono_fecha" in msg or "duplicate key value" in msg:
+                                st.warning("🔒 Ya se registró un sello hoy para este cliente.")
+                            else:
+                                st.error(f"Error al sellar: {e}")
+
+            except Exception as e:
+                st.error(f"Falló al consultar cliente.\n\n{e}")
+
+# ========== NUEVO CLIENTE ==========
+else:
+    name_new = st.text_input("Nombre completo")
+    phone_new = st.text_input("Teléfono")
+    phone_new = normalize_phone(phone_new)
+
+    if st.button("Registrar al cliente y abrir tarjeta", type="primary"):
+        if not name_new.strip() or not phone_new:
+            st.error("Nombre y teléfono son obligatorios.")
+        else:
+            try:
+                # Crea en Customers si no existe
+                exists = get_customer_by_phone(phone_new)
+                if not exists:
+                    create_customer(name_new, phone_new)
+
+                # Asegura tarjeta abierta
+                card = ensure_open_card(phone_new)
+
+                st.success(f"Cliente *{name_new}* registrado. Tarjeta *{card['ID_TARJETA']}* abierta.")
+                st.info("Ya puedes ir a la pestaña Cliente Perrón para sellar.")
+            except Exception as e:
+                st.error(f"Error al registrar: {e}")
 
 st.caption("Listo para empezar a acumular sellos ✨")

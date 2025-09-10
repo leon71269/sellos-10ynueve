@@ -4,10 +4,15 @@ import streamlit as st
 from supabase import create_client, Client
 
 # === Conexión a Supabase (usa st.secrets) ===
-SUPABASE_URL = st.secrets["SUPABASE_URL"]
-SUPABASE_ANON_KEY = st.secrets["SUPABASE_ANON_KEY"]
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+def _clean_ascii(s: str) -> str:
+    # quita espacios/saltos y caracteres no ASCII
+    s = s.strip()
+    return "".join(ch for ch in s if 32 <= ord(ch) < 127)
 
+SUPABASE_URL = _clean_ascii(st.secrets["SUPABASE_URL"])
+SUPABASE_ANON_KEY = _clean_ascii(st.secrets["SUPABASE_ANON_KEY"])
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 # === Helpers de BD ===
 def get_customer_by_phone(phone: str):
     res = supabase.table("Customers").select("*").eq("Phone", phone).maybe_single().execute()
@@ -134,3 +139,4 @@ elif opcion == "Nuevo Cliente":
             s = stamps_count(phone.strip())
             pct = current_discount_pct(s)
             st.caption(f"Sellos: {s} — Descuento actual: {pct:.1f}%")
+

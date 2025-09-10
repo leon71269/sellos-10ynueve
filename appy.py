@@ -17,24 +17,15 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 def get_customer_by_phone(phone: str):
     p = phone.strip()
 
-    # 1) Intento directo a la tabla con nombres tal cual (case-sensitive)
+    # 1) Intento directo a la tabla con mayúsculas
     res = supabase.table("Customers").select("*").eq("Phone", p).maybe_single().execute()
     if res.data:
         return res.data
 
     # 2) Fallback a la vista en minúsculas
     res = supabase.table("customers_api").select("*").eq("phone", p).maybe_single().execute()
-    return res.data
-    except Exception as e:
-        import traceback
-        st.error("Fallo al consultar cliente")
-        st.code(traceback.format_exc())
-        # Algunas versiones exponen e.response si viene de la lib supabase/postgrest:
-        try:
-            st.write(getattr(e, "response", None).text)
-        except:
-            pass
-        return None
+    return res.data
+
 def create_customer(name: str, phone: str):
     supabase.table("Customers").insert({"Name": name.strip(), "Phone": phone.strip()}).execute()
 
@@ -156,6 +147,7 @@ elif opcion == "Nuevo Cliente":
             s = stamps_count(phone.strip())
             pct = current_discount_pct(s)
             st.caption(f"Sellos: {s} — Descuento actual: {pct:.1f}%")
+
 
 
 

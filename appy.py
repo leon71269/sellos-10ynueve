@@ -274,4 +274,5 @@ if phone:
                     with st.expander("Ver detalle del error"):
                         st.code(str(e))
 
-st.caption("Listo para sellar cuando quieras. ✨🐾"
+st.caption("Listo para sellar cuando quieras. ✨🐾")
+

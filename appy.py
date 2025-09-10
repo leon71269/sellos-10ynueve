@@ -1,150 +1,126 @@
-# appy.py — 10ynueve (versión “a prueba de pantallas negras”)
+# appy.py  —  10ynueve - Sistema de Sellos (versión estable)
 
-from datetime import date
 import streamlit as st
+from datetime import date, datetime
+from supabase import create_client, Client
 
-# Pintamos la cabecera antes de tocar secretos/BD
-st.set_page_config(page_title="10ynueve - Sistema de Sellos", page_icon="🟣", layout="centered")
-st.title("10ynueve — Sistema de Sellos")
+# ========== Conexión a Supabase (via st.secrets) ==========
+def _ascii(s: str) -> str:
+    s = (s or "").strip()
+    return "".join(ch for ch in s if 32 <= ord(ch) < 127)
 
-# ---- Conexión perezosa (lazy), con errores visibles en UI ----
-@st.cache_resource(show_spinner=False)
-def get_supabase():
-    """Crea el cliente de Supabase usando secrets.
-    Si falta algo, no crashea la app: devuelve (None, msg_de_error)."""
-    try:
-        from supabase import create_client, Client
-    except Exception as e:
-        return None, f"No se pudo importar 'supabase'. ¿Está en requirements.txt? Detalle: {e}"
+SUPABASE_URL = _ascii(st.secrets["SUPABASE_URL"])
+SUPABASE_ANON_KEY = _ascii(st.secrets["SUPABASE_ANON_KEY"])
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
-    def _clean_ascii(s: str) -> str:
-        s = (s or "").strip()
-        return "".join(ch for ch in s if 32 <= ord(ch) < 127)
-
-    try:
-        url = _clean_ascii(st.secrets["SUPABASE_URL"])
-        key = _clean_ascii(st.secrets["SUPABASE_ANON_KEY"])
-    except Exception as e:
-        return None, f"Faltan secrets SUPABASE_URL / SUPABASE_ANON_KEY. Detalle: {e}"
-
-    try:
-        client = create_client(url, key)
-        return client, None
-    except Exception as e:
-        return None, f"No se pudo crear el cliente de Supabase. Detalle: {e}"
-
-supabase, conn_err = get_supabase()
-if conn_err:
-    st.error("No me pude conectar a Supabase.")
-    with st.expander("Ver detalle"):
-        st.write(conn_err)
-    st.stop()
-
-# ---- Helpers BD (con manejo de errores) ----
+# ========== Helpers de BD ==========
 def get_customer_by_phone(phone: str):
+    """Lee desde la VISTA customers_api (name, phone en minúsculas)."""
     phone = (phone or "").strip()
-
-    # 1) Vista minúsculas
-    try:
-       res = supabase.table("customers_api").select("*").eq("phone", phone).maybe_single().execute()
-        if isinstance(res.data, dict) and res.data:
-            return {"Name": res.data.get("name") or res.data.get("Name"),
-                    "Phone": res.data.get("phone") or res.data.get("Phone")}
-    except Exception:
-        pass
-
-    # 2) Tabla con mayúsculas
-    try:
-        res = supabase.table("Customers").select("*").eq("Phone", phone).maybe_single().execute()
-        if isinstance(res.data, dict) and res.data:
-            return {"Name": res.data.get("Name"), "Phone": res.data.get("Phone")}
-    except Exception:
-        pass
-
-    return None
+    res = supabase.table("customers_api").select("*").eq("phone", phone).maybe_single().execute()
+    return res.data
 
 def create_customer(name: str, phone: str):
+    """Inserta en la tabla real Customers (columnas TitleCase)."""
     payload = {"Name": (name or "").strip(), "Phone": (phone or "").strip()}
-    return supabase.table("Customers").insert(payload).execute()
+    supabase.table("Customers").insert(payload).execute()
+    return payload
 
-def _next_tarjeta_id() -> str:
-    try:
-        cnt = supabase.table("TARJETAS").select("ID_TARJETA", count="exact").execute().count or 0
-    except Exception:
-        cnt = 0
-    return f"T-{cnt+1:03d}"
+def next_sequential_id(prefix: str, table: str, id_col: str) -> str:
+    """Genera ID tipo T-001, C-001 contando filas exactamente."""
+    count = supabase.table(table).select(id_col, count="exact").execute().count or 0
+    return f"{prefix}-{count+1:03d}"
 
 def ensure_open_card(phone: str):
+    """
+    Busca tarjeta abierta en TARJETAS por TELEFONO.
+    Si no existe, la crea con NUMERO_TARJETA = 1 y ESTADO='abierta'.
+    """
     phone = (phone or "").strip()
-    try:
-        res = (supabase.table("TARJETAS").select("*")
-               .eq("TELEFONO", phone).eq("ESTADO", "abierta")
-               .limit(1).execute())
-        if res.data:
-            return res.data[0]
-    except Exception:
-        pass
+    q = (
+        supabase.table("TARJETAS")
+        .select("*")
+        .eq("TELEFONO", phone)
+        .eq("ESTADO", "abierta")
+        .limit(1)
+        .execute()
+    )
+    open_card = (q.data or [None])[0]
 
-    nueva = {
-        "ID_TARJETA": _next_tarjeta_id(),
+    if open_card:
+        return open_card
+
+    # Crear nueva
+    new_id = next_sequential_id("T", "TARJETAS", "ID_TARJETA")
+    payload = {
+        "ID_TARJETA": new_id,
         "TELEFONO": phone,
         "FECHA_INICIO": date.today().isoformat(),
         "FECHA_FIN": None,
         "ESTADO": "abierta",
-        "NUMERO_TARJETA": 1
+        "NUMERO_TARJETA": 1,
     }
-    supabase.table("TARJETAS").insert(nueva).execute()
-    return nueva
+    supabase.table("TARJETAS").insert(payload).execute()
+    return payload
 
-# ---- UI ----
+# ========== UI ==========
+st.set_page_config(page_title="10ynueve — Sistema de Sellos", page_icon="✨", layout="centered")
+st.title("10ynueve — Sistema de Sellos")
+
 modo = st.radio("Selecciona una opción:", ["Cliente Perrón", "Nuevo Cliente"], horizontal=True)
 
-if modo == "Cliente Perrón":
-    phone = st.text_input("Ingresa el número de teléfono del cliente:", max_chars=15)
-    if st.button("Buscar", type="primary"):
-        if not phone.strip():
-            st.warning("Pon un teléfono, porfa.")
+phone_input = st.text_input("Ingresa el número de teléfono del cliente:")
+buscar = st.button("Buscar", type="primary")
+
+# ====== Flujo: Cliente existente ======
+if buscar and modo == "Cliente Perrón":
+    if not phone_input.strip():
+        st.error("Ingresa un teléfono.")
+    else:
+        try:
+            cust = get_customer_by_phone(phone_input)
+            if not cust:
+                st.error("Cliente no encontrado en Customers.")
+                with st.expander("Sugerencia si usas la vista"):
+                    st.code('CREATE OR REPLACE VIEW customers_api AS SELECT "Name" AS name, "Phone" AS phone FROM "Customers";', language="sql")
+            else:
+                st.success(f"Cliente encontrado: *{cust.get('name', '')}* · {cust.get('phone', '')}")
+                card = ensure_open_card(cust["phone"])
+                st.info(
+                    f"Tarjeta activa: *{card['ID_TARJETA']}* · Estado: *{card['ESTADO']}* · "
+                    f"Número: *{card['NUMERO_TARJETA']}* · Inicio: {card['FECHA_INICIO']}"
+                )
+                st.caption("Listo para sellar cuando quieras. 🧋✨")
+        except Exception as e:
+            st.error("Falló al consultar cliente.")
+            st.exception(e)
+
+# ====== Flujo: Nuevo cliente ======
+if modo == "Nuevo Cliente":
+    with st.form("nuevo_cliente"):
+        nombre = st.text_input("Nombre")
+        telefono_nuevo = st.text_input("Teléfono")
+        submitted = st.form_submit_button("Registrar cliente y abrir tarjeta", type="primary")
+
+    if submitted:
+        if not nombre.strip() or not telefono_nuevo.strip():
+            st.error("Nombre y teléfono son obligatorios.")
         else:
             try:
-                cust = get_customer_by_phone(phone)
-                if not cust:
-                    st.error("Cliente no encontrado en *Customers*.")
-                    with st.expander("Sugerencia si usas la vista"):
-                        st.markdown(
-                            "Crea/actualiza la vista:\n\n"
-                            "sql\n"
-                            "CREATE OR REPLACE VIEW customers_api AS\n"
-                            "SELECT \"Name\" AS name, \"Phone\" AS phone FROM \"Customers\";\n"
-                            "\n"
-                        )
+                # Evita duplicados por teléfono (checa la vista)
+                exists = get_customer_by_phone(telefono_nuevo)
+                if exists:
+                    st.warning("Ese teléfono ya existe, abriendo/asegurando tarjeta…")
                 else:
-                    card = ensure_open_card(cust["Phone"])
-                    st.success(
-                        f"Cliente: *{cust['Name']}*  \n"
-                        f"Tel: *{cust['Phone']}*  \n"
-                        f"Tarjeta abierta: *{card['ID_TARJETA']}* (inicio {card['FECHA_INICIO']})"
-                    )
+                    create_customer(nombre, telefono_nuevo)
+                    st.success(f"Cliente *{nombre}* creado.")
+
+                card = ensure_open_card(telefono_nuevo)
+                st.info(
+                    f"Tarjeta activa: *{card['ID_TARJETA']}* · Estado: *{card['ESTADO']}* · "
+                    f"Número: *{card['NUMERO_TARJETA']}* · Inicio: {card['FECHA_INICIO']}"
+                )
+                st.caption("Cliente listo para acumular sellos. ✨")
             except Exception as e:
-                st.error("Fallo al consultar/abrir tarjeta.")
-                with st.expander("Ver error"):
-                    st.exception(e)
-
-else:
-    name = st.text_input("Nombre")
-    phone = st.text_input("Teléfono", max_chars=15)
-    if st.button("Registrar cliente y abrir tarjeta", type="primary"):
-        if not name.strip() or not phone.strip():
-            st.warning("Nombre y teléfono obligatorios.")
-        else:
-            try:
-                if not get_customer_by_phone(phone):
-                    create_customer(name, phone)
-                card = ensure_open_card(phone)
-                st.success(f"Cliente *{name}* listo y tarjeta *{card['ID_TARJETA']}* abierta ✅")
-            except Exception as e:
-                st.error("Error al registrar cliente / abrir tarjeta.")
-                with st.expander("Ver error"):
-                    st.exception(e)
-
-st.caption("Listo para empezar a acumular sellos ✨")
-
+                st.error("Error al registrar/abrir tarjeta.")
+                st.exception(e)

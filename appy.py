@@ -15,10 +15,21 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 # ========== Helpers de BD ==========
 def get_customer_by_phone(phone: str):
-    """Lee desde la VISTA customers_api (name, phone en minúsculas)."""
+    """
+    Lee desde la vista customers_api sin usar maybe_single()
+    para evitar el 204 Missing response. Devuelve dict o None.
+    """
     phone = (phone or "").strip()
-    res = supabase.table("customers_api").select("*").eq("phone", phone).maybe_single().execute()
-    return res.data
+    res = (
+        supabase
+        .table("customers_api")
+        .select("*")
+        .eq("phone", phone)
+        .limit(1)
+        .execute()
+    )
+    rows = res.data or []
+    return rows[0] if rows else None
 
 def create_customer(name: str, phone: str):
     """Inserta en la tabla real Customers (columnas TitleCase)."""
@@ -124,3 +135,4 @@ if modo == "Nuevo Cliente":
             except Exception as e:
                 st.error("Error al registrar/abrir tarjeta.")
                 st.exception(e)
+

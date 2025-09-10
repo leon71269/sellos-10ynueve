@@ -1,35 +1,31 @@
+# appy.py
 import re
-from datetime import datetime, date, timezone, timedelta
-
+from datetime import date, datetime
 import streamlit as st
 from supabase import create_client, Client
 
-# =========================
-#  Conexión a Supabase
-# =========================
-SUPABASE_URL = st.secrets["SUPABASE_URL"]
-SUPABASE_ANON_KEY = st.secrets["SUPABASE_ANON_KEY"]
+# =====================================================
+#  Configuración: variables de entorno (st.secrets)
+# =====================================================
+def _clean_ascii(s: str) -> str:
+    s = (s or "").strip()
+    return "".join(ch for ch in s if 32 <= ord(ch) < 127)
+
+SUPABASE_URL = _clean_ascii(st.secrets["SUPABASE_URL"])
+SUPABASE_ANON_KEY = _clean_ascii(st.secrets["SUPABASE_ANON_KEY"])
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
-# =========================
-#  Utils
-# =========================
-MX_TZ = timezone(timedelta(hours=-6))  # sin DST. Si quieres DST, cámbialo por pendulum/pytz.
-TODAY = lambda: datetime.now(MX_TZ).date()
-
+# =====================================================
+#  Helpers de datos
+# =====================================================
 def normalize_phone(raw: str) -> str:
-    """Deja solo dígitos en el teléfono."""
+    """Solo dígitos."""
     return "".join(re.findall(r"\d+", raw or ""))
 
-# =========================
-#  Funciones de BD
-# =========================
 def get_customer_by_phone(phone: str):
     """
-    Lee cliente desde la VISTA customers_api (name/phone en minúsculas).
-    La vista debe ser:
-      create or replace view customers_api as
-      select "Name" as name, "Phone" as phone from "Customers";
+    Busca cliente en VISTA customers_api (columnas en minúsculas: name, phone).
+    Retorna dict o None.
     """
     res = (
         supabase.table("customers_api")
@@ -41,42 +37,56 @@ def get_customer_by_phone(phone: str):
     return res.data  # dict | None
 
 def create_customer(name: str, phone: str):
-    return (
-        supabase.table("Customers")
-        .insert({"Name": (name or "").strip(), "Phone": (phone or "").strip()})
+    """Crea cliente en tabla Customers (columnas con mayúsculas)."""
+    payload = {"Name": (name or "").strip(), "Phone": (phone or "").strip()}
+    res = supabase.table("Customers").insert(payload).execute()
+    return res.data[0] if res.data else None
+
+def _next_card_id() -> str:
+    """
+    Lee el último ID_TARJETA (ordenado desc) y genera el siguiente.
+    Evita colisiones de ID.
+    """
+    res = (
+        supabase.table("TARJETAS")
+        .select("ID_TARJETA")
+        .order("ID_TARJETA", desc=True)
+        .limit(1)
         .execute()
     )
-
-def next_sequential_id(prefix: str, table: str, id_col: str) -> str:
-    """Cuenta filas exactas en table y genera ID estilo T-001 / C-001."""
-    count = supabase.table(table).select(id_col, count="exact").execute().count or 0
-    return f"{prefix}-{count+1:03d}"
+    last_id = res.data[0]["ID_TARJETA"] if res.data else None
+    if last_id:
+        m = re.search(r"(\d+)$", last_id)
+        nxt = int(m.group(1)) + 1 if m else 1
+    else:
+        nxt = 1
+    return f"T-{nxt:03d}"
 
 def ensure_open_card(phone: str):
     """
-    Busca tarjeta abierta para el teléfono. Si no existe, crea una:
-      - ID_TARJETA: T-###
-      - NUMERO_TARJETA: entero secuencial
-      - ESTADO: 'abierta'
-      - FECHA_INICIO: hoy
+    Devuelve tarjeta abierta del teléfono o crea una nueva.
+    Estructura TARJETAS esperada:
+      - ID_TARJETA (text) PK/UNIQUE
+      - TELEFONO (text, FK a Customers.Phone)
+      - FECHA_INICIO (date)
+      - FECHA_FIN (date|null)
+      - ESTADO (text: 'abierta'|'cerrada')
+      - NUMERO_TARJETA (int)  -- contador de cuántas tarjetas va (1,2,...)
     """
-    # 1) ¿hay tarjeta abierta?
-    open_card = (
+    # 1) ¿ya hay abierta?
+    res = (
         supabase.table("TARJETAS")
         .select("*")
         .eq("TELEFONO", phone)
         .eq("ESTADO", "abierta")
         .maybe_single()
         .execute()
-        .data
     )
-    if open_card:
-        return open_card
+    if res.data:
+        return res.data
 
-    # 2) no hay: crear una
-    new_id = next_sequential_id("T", "TARJETAS", "ID_TARJETA")
-    # NUMERO_TARJETA = cuántas tarjetas tiene la persona + 1
-    num_tarjetas = (
+    # 2) contar cuántas tarjetas tiene para asignar NUMERO_TARJETA
+    cnt = (
         supabase.table("TARJETAS")
         .select("ID_TARJETA", count="exact")
         .eq("TELEFONO", phone)
@@ -84,195 +94,216 @@ def ensure_open_card(phone: str):
         .count
         or 0
     )
-    numero_tarjeta = num_tarjetas + 1
+    new_id = _next_card_id()
+    payload = {
+        "ID_TARJETA": new_id,
+        "TELEFONO": phone,
+        "FECHA_INICIO": date.today().isoformat(),
+        "FECHA_FIN": None,
+        "ESTADO": "abierta",
+        "NUMERO_TARJETA": int(cnt) + 1,
+    }
+    created = supabase.table("TARJETAS").insert(payload).execute()
+    return created.data[0] if created.data else None
 
-    created = (
-        supabase.table("TARJETAS")
-        .insert(
-            {
-                "ID_TARJETA": new_id,
-                "TELEFONO": phone,
-                "FECHA_INICIO": str(TODAY()),
-                "FECHA_FIN": None,
-                "ESTADO": "abierta",
-                "NUMERO_TARJETA": numero_tarjeta,
-            }
-        )
-        .execute()
-        .data
-    )
-    # Devuelve la fila recién creada
-    return (
-        supabase.table("TARJETAS")
-        .select("*")
-        .eq("ID_TARJETA", new_id)
-        .maybe_single()
-        .execute()
-        .data
-    )
-
-def count_stamps(phone: str) -> int:
-    """Cuenta sellos en COMPRAS por teléfono."""
-    return (
+def seals_count(phone: str) -> int:
+    """
+    Cuenta sellos en COMPRAS por TELEFONO.
+    Estructura COMPRAS esperada:
+      - ID_COMPRA (text) p.ej. C-001
+      - TELEFONO (text)
+      - FECHA (date)
+      - SELLO_OTORGADO (bool|int|null) opcional
+    """
+    res = (
         supabase.table("COMPRAS")
         .select("ID_COMPRA", count="exact")
         .eq("TELEFONO", phone)
         .execute()
-        .count
-        or 0
     )
+    return int(res.count or 0)
 
-def has_stamp_today(phone: str) -> bool:
-    """¿Ya tiene un sello hoy? Candado 1 por día."""
-    today_str = str(TODAY())
-    rows = (
+def _today_iso() -> str:
+    return date.today().isoformat()
+
+def already_stamped_today(phone: str) -> bool:
+    """Candado: ¿ya se selló hoy este teléfono?"""
+    res = (
         supabase.table("COMPRAS")
-        .select("ID_COMPRA")
+        .select("ID_COMPRA", count="exact")
         .eq("TELEFONO", phone)
-        .eq("FECHA", today_str)
+        .eq("FECHA", _today_iso())
         .execute()
-        .data
-        or []
     )
-    return len(rows) > 0
+    return (res.count or 0) > 0
 
-def seal_today(phone: str):
-    """
-    Inserta sello (una vez al día). Devuelve tupla (ok: bool, msg: str).
-    Inserta en COMPRAS: ID_COMPRA, TELEFONO, FECHA, SELLO_OTORGADO=1
-    """
-    if has_stamp_today(phone):
-        return False, "Tarjeta sellada hoy, vuelve mañana por más sellos"
+def _next_purchase_id() -> str:
+    res = (
+        supabase.table("COMPRAS")
+        .select("ID_COMPRA", count="exact")
+        .execute()
+    )
+    n = int(res.count or 0) + 1
+    return f"C-{n:04d}"
 
-    new_id = next_sequential_id("C", "COMPRAS", "ID_COMPRA")
-    data = {
-        "ID_COMPRA": new_id,
+def stamp_today(phone: str):
+    """Inserta compra de hoy (un sello). Respeta candado fuera."""
+    payload = {
+        "ID_COMPRA": _next_purchase_id(),
         "TELEFONO": phone,
-        "FECHA": str(TODAY()),
-        "SELLO_OTORGADO": 1,
+        "FECHA": _today_iso(),
+        "SELLO_OTORGADO": True,
     }
-    supabase.table("COMPRAS").insert(data).execute()
-    return True, "Tarjeta sellada por Greg!! 🐾"
+    supabase.table("COMPRAS").insert(payload).execute()
 
-def get_discount_for_count(sellos: int):
+def current_discount_for(seals: int) -> dict:
     """
-    Devuelve el descuento 'actual' según total de sellos.
-    Toma la fila de DESCUENTOS (ACTIVO=1) en el orden de ID_DESCUENTO;
-    usa índice = min(sellos, len-1).
+    Devuelve el descuento que toca dado # de sellos acumulados.
+    Estrategia: toma DESCUENTOS activos ordenados por ID_DESCUENTO asc
+    y hace index = min(sellos, len-1). Así el primer registro aplica con 0 sellos,
+    el segundo con 1 sello, etc.
+    Estructura DESCUENTOS:
+      - ID_DESCUENTO (text)
+      - DESCRIPCION (text)
+      - TIPO (text) p.ej. 'PORCENTAJE'|'PROMO'
+      - VAL (numeric) p.ej. 10, 5, ...
+      - ACTIVO (int/bool) 1 = activo
     """
-    rows = (
+    res = (
         supabase.table("DESCUENTOS")
         .select("*")
         .eq("ACTIVO", 1)
         .order("ID_DESCUENTO", desc=False)
         .execute()
-        .data
-        or []
     )
+    rows = res.data or []
     if not rows:
-        return None
-    idx = min(sellos, len(rows) - 1)
+        return {"DESCRIPCION": "Sin descuento", "TIPO": "NINGUNO", "VAL": 0}
+
+    idx = min(seals, len(rows) - 1)
     return rows[idx]
 
-# =========================
+# =====================================================
 #  UI
-# =========================
-st.set_page_config(page_title="10ynueve — Sistema de Sellos", layout="wide")
+# =====================================================
+st.set_page_config(page_title="10ynueve — Sistema de Sellos", page_icon="⭐", layout="wide")
+
+st.markdown(
+    """
+    <style>
+    .pill { border-radius: 12px; padding: 10px 14px; margin: 6px 0; font-weight: 600; }
+    .pill-green { background:#1f6f43; color:#e8fff4; }
+    .pill-blue { background:#144e66; color:#e6f7ff; }
+    .pill-amber { background:#6b5800; color:#fff6d6; }
+    .pill-lime { background:#274b1f; color:#ecffd7; }
+    .btn-primary button { background:#ff7a1a !important; color:white !important; font-weight:700; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("10ynueve — Sistema de Sellos")
 
 mode = st.radio("Selecciona una opción:", ["Cliente Perrón", "Nuevo Cliente"], horizontal=True)
 
-phone_input = st.text_input("Ingresa el número de teléfono del cliente:")
-phone_input = normalize_phone(phone_input)
+phone_input = st.text_input("Ingresa el número de teléfono del cliente:", "")
+col_busc, _ = st.columns([1, 3])
+with col_busc:
+    buscar = st.button("Buscar", use_container_width=True)
 
-col_btn, _ = st.columns([1, 5])
-buscar = col_btn.button("Buscar", type="primary")
+def show_card_box(card: dict):
+    if not card:
+        return
+    st.markdown(
+        f"""<div class="pill pill-blue">
+        <b>Tarjeta activa:</b> {card['ID_TARJETA']} &nbsp;·&nbsp;
+        <b>Estado:</b> {card['ESTADO']} &nbsp;·&nbsp;
+        <b>Número:</b> {card['NUMERO_TARJETA']} &nbsp;·&nbsp;
+        <b>Inicio:</b> {card['FECHA_INICIO']}
+        </div>""",
+        unsafe_allow_html=True,
+    )
 
-if "last_phone" not in st.session_state:
-    st.session_state.last_phone = None
+def show_seals_box(n: int):
+    st.markdown(f"""<div class="pill pill-lime"><b>Sellos acumulados:</b> {n}</div>""", unsafe_allow_html=True)
 
+def show_discount_box(desc_row: dict):
+    if not desc_row:
+        return
+    tipo = desc_row.get("TIPO", "")
+    val = desc_row.get("VAL", 0)
+    descripcion = desc_row.get("DESCRIPCION", "Descuento")
+    label = descripcion
+    if tipo.upper() == "PORCENTAJE":
+        label = f"{descripcion} ({float(val):.1f}%)"
+    st.markdown(f"""<div class="pill pill-amber"><b>Descuento actual:</b> {label}</div>""", unsafe_allow_html=True)
+
+# ========== Lógica principal ==========
 if buscar:
-    if not phone_input:
-        st.error("Escribe un teléfono.")
-    else:
-        st.session_state.last_phone = phone_input
-
-phone = st.session_state.last_phone
-
-if phone:
-    if mode == "Cliente Perrón":
-        # Buscar cliente
-        try:
+    try:
+        phone = normalize_phone(phone_input)
+        if not phone:
+            st.warning("Ingresa un teléfono válido.")
+        else:
             cust = get_customer_by_phone(phone)
             if not cust:
                 st.error("Cliente no encontrado en Customers.")
-            else:
-                st.success(f"Cliente encontrado: *{cust['name']}* · {phone}")
-
-                # Asegurar tarjeta abierta
-                card = ensure_open_card(phone)
-                st.info(
-                    f"*Tarjeta activa:* {card['ID_TARJETA']} · *Estado:* {card['ESTADO']} · "
-                    f"*Número:* {card['NUMERO_TARJETA']} · *Inicio:* {card['FECHA_INICIO']}"
-                )
-
-                # Mostrar sellos y descuento
-                total_sellos = count_stamps(phone)
-                st.success(f"*Sellos acumulados:* {total_sellos}")
-
-                disc = get_discount_for_count(total_sellos)
-                if disc:
-                    st.warning(
-                        f"*Descuento actual:* {disc['DESCRIPCION']} ({disc['VALOR']}{'%' if disc['TIPO']=='PORCENTAJE' else ''})"
+                with st.expander("Sugerencia si usas la vista"):
+                    st.code(
+                        'CREATE OR REPLACE VIEW customers_api AS SELECT "Name" AS name, "Phone" AS phone FROM "Customers";',
+                        language="sql",
                     )
-                else:
-                    st.warning("No hay descuentos activos configurados.")
+            else:
+                st.markdown(
+                    f"""<div class="pill pill-green">
+                    Cliente encontrado: <b>{cust['name']}</b> · {cust['phone']}
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+                card = ensure_open_card(phone)
+                show_card_box(card)
 
-                # ----- Botón SELLAR -----
-                colA, colB = st.columns([1.2, 6])
-                if colA.button("Sellar"):
-                    ok, msg = seal_today(phone)
-                    if ok:
-                        st.success(msg)
+                n_seals = seals_count(phone)
+                show_seals_box(n_seals)
+
+                desc_row = current_discount_for(n_seals)
+                show_discount_box(desc_row)
+
+                # Botón SELLAR (candado 1 por día)
+                sellar = st.button("Sellar tarjeta", key="sellar_btn", type="primary")
+                if sellar:
+                    if already_stamped_today(phone):
+                        st.warning("Tarjeta sellada hoy, vuelve mañana por más sellos.")
                     else:
-                        st.warning(msg)
+                        stamp_today(phone)
+                        st.success("Tarjeta sellada por Greg!! 🐾")
+                        # refrescar contadores
+                        n_seals = seals_count(phone)
+                        show_seals_box(n_seals)
+                        desc_row = current_discount_for(n_seals)
+                        show_discount_box(desc_row)
 
-                    # Recalcular y mostrar de nuevo
-                    total_sellos = count_stamps(phone)
-                    st.info(f"*Sellos acumulados (actualizado):* {total_sellos}")
+    except Exception as e:
+        st.error("Falló al consultar cliente.")
+        st.code(f"{type(e)._name_}: {e}")
 
-                    disc = get_discount_for_count(total_sellos)
-                    if disc:
-                        st.info(
-                            f"*Descuento actual:* {disc['DESCRIPCION']} ({disc['VALOR']}{'%' if disc['TIPO']=='PORCENTAJE' else ''})"
-                        )
-
-        except Exception as e:
-            st.error("Falló al consultar cliente.")
-            with st.expander("Ver detalle del error"):
-                st.code(str(e))
-
-    else:
-        # Nuevo cliente
-        st.subheader("Dar de alta nuevo cliente")
-        name = st.text_input("Nombre")
-        if st.button("Registrar cliente y abrir tarjeta", type="primary"):
-            if not name or not phone:
+# ====== Alta de nuevo cliente ======
+if mode == "Nuevo Cliente":
+    st.subheader("Dar de alta nuevo cliente")
+    nuevo_nombre = st.text_input("Nombre")
+    if st.button("Registrar cliente y abrir tarjeta", key="alta_btn"):
+        try:
+            phone = normalize_phone(phone_input)
+            if not nuevo_nombre.strip() or not phone:
                 st.error("Nombre y teléfono obligatorios.")
             else:
-                try:
-                    # Si no existe lo creo
-                    if not get_customer_by_phone(phone):
-                        create_customer(name, phone)
-                    # Aseguro tarjeta abierta
-                    card = ensure_open_card(phone)
-                    st.success(
-                        f"Cliente *{name}* registrado con tarjeta *{card['ID_TARJETA']}*."
-                    )
-                except Exception as e:
-                    st.error("Error al registrar.")
-                    with st.expander("Ver detalle del error"):
-                        st.code(str(e))
+                # evita duplicar clientes:
+                existing = get_customer_by_phone(phone)
+                if not existing:
+                    create_customer(nuevo_nombre, phone)
+                card = ensure_open_card(phone)
+                st.success(f"Cliente {nuevo_nombre} registrado con tarjeta {card['ID_TARJETA']}.")
+        except Exception as e:
+            st.error(f"Error: {e}")
 
 st.caption("Listo para sellar cuando quieras. ✨🐾")
-

@@ -15,9 +15,9 @@ from supabase import create_client, Client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 # === Helpers de BD ===
 def get_customer_by_phone(phone: str):
-    res = supabase.table("Customers").select("*").eq("Phone", phone).maybe_single().execute()
+    # leer desde la vista en minúsculas
+    res = supabase.table("customers_api").select("*").eq("phone", phone).maybe_single().execute()
     return res.data
-
 def create_customer(name: str, phone: str):
     supabase.table("Customers").insert({"Name": name.strip(), "Phone": phone.strip()}).execute()
 
@@ -139,5 +139,6 @@ elif opcion == "Nuevo Cliente":
             s = stamps_count(phone.strip())
             pct = current_discount_pct(s)
             st.caption(f"Sellos: {s} — Descuento actual: {pct:.1f}%")
+
 
 

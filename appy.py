@@ -1,31 +1,34 @@
-# appy.py — 10ynueve • Sistema de Sellos
-# Requisitos en requirements.txt:
-# streamlit
-# supabase
-# python-dateutil
+# appy.py — 10ynueve • Sistema de Sellos (Streamlit + Supabase)
 
 import re
-from datetime import date, datetime
+from datetime import date
 import streamlit as st
 from supabase import create_client, Client
 
-# ============================================
-# Conexión a Supabase
-# ============================================
+# =========================================
+# Conexión a Supabase (usa Secrets en Streamlit)
+#   En Streamlit Cloud agrega:
+#     SUPABASE_URL
+#     SUPABASE_ANON_KEY
+# =========================================
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_ANON_KEY = st.secrets["SUPABASE_ANON_KEY"]
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
-# ============================================
+# =========================================
 # Helpers de BD
-# ============================================
-
+# =========================================
 def normalize_phone(raw: str) -> str:
-    """Deja solo dígitos en el teléfono."""
+    """Deja solo dígitos."""
     return "".join(re.findall(r"\d+", raw or ""))
 
 def get_customer_by_phone(phone: str):
-    """Busca cliente en la vista customers_api"""
+    """
+    Lee desde la VISTA 'customers_api' (columnas en minúsculas: name, phone).
+    Crea la vista con:
+      create or replace view customers_api as
+      select "Name" as name, "Phone" as phone from "Customers";
+    """
     res = (
         supabase.table("customers_api")
         .select("*")
@@ -36,19 +39,17 @@ def get_customer_by_phone(phone: str):
     return res.data  # dict | None
 
 def create_customer(name: str, phone: str):
-    """Crea cliente nuevo en tabla Customers"""
-    supabase.table("Customers").insert(
-        {"Name": name.strip(), "Phone": phone.strip()}
-    ).execute()
+    """Inserta en la tabla base con columnas 'Name' y 'Phone'."""
+    supabase.table("Customers").insert({"Name": name.strip(), "Phone": phone}).execute()
 
 def next_card_number() -> str:
-    """Genera un ID de tarjeta incremental tipo T-001"""
-    res = supabase.table("TARJETAS").select("id", count="exact").execute()
-    count = res.count or 0
-    return f"T-{count+1:03d}"
+    """Genera ID tipo T-001 según el conteo actual."""
+    res = supabase.table("TARJETAS").select("ID_TARJETA", count="exact").execute()
+    n = res.count or 0
+    return f"T-{n+1:03d}"
 
-def ensure_open_card(phone: str):
-    """Revisa si cliente tiene tarjeta abierta, si no crea una nueva"""
+def ensure_open_card(phone: str) -> dict:
+    """Devuelve una tarjeta abierta para el teléfono; si no existe, la crea."""
     res = (
         supabase.table("TARJETAS")
         .select("*")
@@ -59,107 +60,113 @@ def ensure_open_card(phone: str):
     )
     card = res.data
     if not card:
-        card_id = next_card_number()
         card = {
-            "ID_TARJETA": card_id,
+            "ID_TARJETA": next_card_number(),
             "TELEFONO": phone,
             "ESTADO": "abierta",
-            "NUM_SELLos": 0,
+            "NUM_SELLOS": 0,
             "FECHA_INICIO": str(date.today()),
             "ULTIMO_SELLO": None,
         }
         supabase.table("TARJETAS").insert(card).execute()
     return card
 
-def add_stamp(card):
-    """Agrega un sello si no se ha sellado hoy"""
+def add_stamp(card: dict) -> bool:
+    """Agrega sello si la tarjeta no fue sellada hoy (candado)."""
     hoy = str(date.today())
-    if card["ULTIMO_SELLO"] == hoy:
-        return False  # ya sellado hoy
-
-    nuevos_sellos = (card["NUM_SELLos"] or 0) + 1
+    if card.get("ULTIMO_SELLO") == hoy:
+        return False
+    nuevos = int(card.get("NUM_SELLOS") or 0) + 1
     supabase.table("TARJETAS").update(
-        {"NUM_SELLos": nuevos_sellos, "ULTIMO_SELLO": hoy}
+        {"NUM_SELLOS": nuevos, "ULTIMO_SELLO": hoy}
     ).eq("ID_TARJETA", card["ID_TARJETA"]).execute()
     return True
 
-def get_discount_by_stamps(stamps: int):
-    """Obtiene descuento según número de sellos"""
-    res = (
-        supabase.table("DESCUENTOS")
-        .select("*")
-        .order("VAL", desc=False)
-        .execute()
-    )
-    descuentos = res.data or []
-    if not descuentos:
+def get_discount_by_stamps(stamps: int) -> dict:
+    """
+    Devuelve la fila de DESCUENTOS acorde al número de sellos (1..n).
+    Usa la columna VAL (número ordinal de sello) y DESCRIPCION (% o promo).
+    """
+    res = supabase.table("DESCUENTOS").select("*").order("VAL", desc=False).execute()
+    rows = res.data or []
+    if not rows:
         return {"DESCRIPCION": "Sin descuento", "VAL": 0}
+    # clamp a rango válido 1..len(rows)
+    idx = max(1, min(stamps, len(rows))) - 1
+    return rows[idx]
 
-    idx = min(stamps, len(descuentos)) - 1
-    if idx < 0:
-        idx = 0
-    return descuentos[idx]
-
-# ============================================
-# Interfaz Streamlit
-# ============================================
+# =========================================
+# UI
+# =========================================
+st.set_page_config(page_title="10ynueve — Sistema de Sellos", page_icon="🐾", layout="centered")
 
 st.title("10ynueve — Sistema de Sellos")
 st.caption("Listo para sellar cuando quieras. ✨🐾")
 
-modo = st.radio("Selecciona una opción:", ["Cliente Perrón", "Nuevo Cliente"])
+modo = st.radio("Selecciona una opción:", ["Cliente Perrón", "Nuevo Cliente"], horizontal=True)
 
-phone_input = st.text_input("Ingresa el número de teléfono del cliente:")
-
-if st.button("Buscar"):
-    phone = normalize_phone(phone_input)
-    if not phone:
-        st.error("⚠ Ingresa un número válido.")
-    else:
-        if modo == "Cliente Perrón":
-            # ============================
-            # CLIENTE EXISTENTE
-            # ============================
-            cust = get_customer_by_phone(phone)
-            if not cust:
-                st.error("Cliente no encontrado en Customers.")
-            else:
-                st.success(f"Cliente encontrado: {cust['name']} - {cust['phone']}")
-                card = ensure_open_card(phone)
-
-                st.info(
-                    f"Tarjeta activa: {card['ID_TARJETA']} - "
-                    f"Estado: {card['ESTADO']} - "
-                    f"Número: {card['NUM_SELLos']} - "
-                    f"Inicio: {card['FECHA_INICIO']}"
-                )
-
-                descuento = get_discount_by_stamps(card["NUM_SELLos"])
-                st.warning(
-                    f"Descuento actual: {descuento['DESCRIPCION']} ({descuento['VAL']}%)"
-                )
-
-                if st.button("Sellar tarjeta"):
-                    if add_stamp(card):
-                        st.success("🐾 Tarjeta sellada por Greg!!")
-                    else:
-                        st.error("Tarjeta ya sellada hoy, vuelve mañana por más sellos ✨")
-
+# ---------- Modo Cliente Perrón ----------
+if modo == "Cliente Perrón":
+    phone_input = st.text_input("Ingresa el número de teléfono del cliente:")
+    if st.button("Buscar", use_container_width=False):
+        phone = normalize_phone(phone_input)
+        if not phone:
+            st.error("⚠ Ingresa un número válido.")
         else:
-            # ============================
-            # CLIENTE NUEVO
-            # ============================
-            cust = get_customer_by_phone(phone)
-            if cust:
-                st.error("⚠ Este número ya está registrado.")
-            else:
-                name_input = st.text_input("Nombre")
-                if st.button("Registrar cliente y abrir tarjeta"):
-                    if not name_input.strip():
-                        st.error("El nombre no puede estar vacío.")
-                    else:
-                        create_customer(name_input, phone)
-                        card = ensure_open_card(phone)
-                        st.success(
-                            f"Cliente {name_input} registrado con tarjeta {card['ID_TARJETA']}."
+            try:
+                cust = get_customer_by_phone(phone)
+                if not cust:
+                    st.error("Cliente no encontrado en Customers.")
+                else:
+                    st.success(f"Cliente encontrado: {cust['name']} · {cust['phone']}")
+                    card = ensure_open_card(phone)
+
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.info(
+                            f"*Tarjeta activa:* {card['ID_TARJETA']}  \n"
+                            f"*Estado:* {card['ESTADO']}  \n"
+                            f"*Inicio:* {card['FECHA_INICIO']}"
                         )
+                    with col2:
+                        st.success(f"*Sellos acumulados:* {card['NUM_SELLOS']}")
+
+                    descuento = get_discount_by_stamps(int(card["NUM_SELLOS"]))
+                    st.warning(f"*Descuento actual:* {descuento['DESCRIPCION']}")
+
+                    if st.button("Sellar tarjeta", type="primary"):
+                        # refresca la tarjeta por si fue creada en esta búsqueda
+                        card = ensure_open_card(phone)
+                        if add_stamp(card):
+                            st.success("🐾 Tarjeta sellada por Greg!!")
+                        else:
+                            st.error("Tarjeta ya sellada hoy, vuelve mañana por más sellos ✨")
+
+            except Exception as e:
+                st.error("Falló al consultar cliente.")
+                st.code(f"{type(e)._name_}: {e}")
+
+# ---------- Modo Nuevo Cliente ----------
+else:
+    st.subheader("Dar de alta nuevo cliente")
+    name_input = st.text_input("Nombre")
+    phone_input = st.text_input("Teléfono")
+
+    if st.button("Registrar cliente y abrir tarjeta", type="primary"):
+        phone = normalize_phone(phone_input)
+        name = (name_input or "").strip()
+        if not name or not phone:
+            st.error("Nombre y teléfono son obligatorios.")
+        else:
+            try:
+                # ¿ya existe?
+                if get_customer_by_phone(phone):
+                    st.error("⚠ Este número ya está registrado.")
+                else:
+                    create_customer(name, phone)
+                    card = ensure_open_card(phone)
+                    st.success(f"Cliente *{name}* registrado con tarjeta *{card['ID_TARJETA']}*.")
+            except Exception as e:
+                st.error("Falló el registro.")
+                st.code(f"{type(e)._name_}: {e}")
+```0
